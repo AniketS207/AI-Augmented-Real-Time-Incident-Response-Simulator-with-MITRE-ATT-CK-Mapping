@@ -1,19 +1,19 @@
-# Import and Load CSV
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from alert_manager import send_email_alert
 from report_generator import generate_report
+from datetime import datetime
 
-df = pd.read_csv("sysmon.csv", encoding='utf-8', low_memory=False)
+# === LOAD SYSLOG DATA ===
+df = pd.read_csv("data/sysmon.csv", encoding='utf-8', low_memory=False)
 
-# Clean + Filter Logs
+# Filter relevant event types
 event_ids = [1, 3, 10, 11]
 df = df[df['Id'].isin(event_ids)]
 df['TimeCreated'] = pd.to_datetime(df['TimeCreated'], errors='coerce')
-df = df.dropna(subset=['TimeCreated'])
-df = df.sort_values(by='TimeCreated')
+df = df.dropna(subset=['TimeCreated']).sort_values(by='TimeCreated')
 
-# Feature Engineering
+# === FEATURE ENGINEERING ===
 df_feat = df.copy()
 df_feat['EventType'] = df_feat['Id']
 df_feat['Hour'] = df_feat['TimeCreated'].dt.hour
@@ -22,67 +22,79 @@ df_feat['ContainsDownload'] = df_feat['Message'].str.contains('curl|Invoke-WebRe
 df_feat['ProcessCount'] = df_feat['Message'].str.count('Process')
 df_feat = df_feat[['EventType', 'Hour', 'ContainsEncoded', 'ContainsDownload', 'ProcessCount']]
 
-# AI Model (Isolation Forest)
+# === AI DETECTION ===
 model = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
 df_feat['Anomaly'] = model.fit_predict(df_feat)
 df_feat['AnomalyLabel'] = df_feat['Anomaly'].apply(lambda x: 'Malicious' if x == -1 else 'Normal')
 
-# Output Results
-print(df_feat[['EventType', 'Hour', 'AnomalyLabel']].head())
+# === RISK SCORING ===
+def calculate_risk(row):
+    score = 0
+    if row['ContainsEncoded']: score += 3
+    if row['ContainsDownload']: score += 2
+    if row['EventType'] == 1: score += 2
+    if row['ProcessCount'] > 2: score += 1
+    return score
 
+def classify_risk(score):
+    if score >= 6:
+        return "High"
+    elif score >= 3:
+        return "Medium"
+    else:
+        return "Low"
 
-# Basic MITRE ATT&CK Technique Mapping
+df_feat['RiskScore'] = df_feat.apply(calculate_risk, axis=1)
+df_feat['Severity'] = df_feat['RiskScore'].apply(classify_risk)
+
+# === MITRE ATT&CK MAPPING ===
 def map_mitre(row):
-    message = row['Message'].lower()
-    
-    if '-enc' in message or 'frombase64string' in message:
+    msg = row['Message'].lower()
+    if '-enc' in msg or 'frombase64string' in msg:
         return 'T1059.001 - PowerShell'
-    elif 'curl' in message or 'wget' in message or 'http' in message:
+    elif 'curl' in msg or 'wget' in msg or 'http' in msg:
         return 'T1105 - Ingress Tool Transfer'
-    elif 'reg add' in message or 'registry' in message:
+    elif 'reg add' in msg or 'registry' in msg:
         return 'T1112 - Modify Registry'
-    elif 'taskkill' in message:
+    elif 'taskkill' in msg:
         return 'T1562.001 - Disable Security Tools'
-    elif 'rundll32' in message:
+    elif 'rundll32' in msg:
         return 'T1218.011 - Signed Binary Proxy Execution: Rundll32'
     else:
         return 'T0000 - Unknown'
 
-# Apply to original DataFrame
 df['MITRE_Technique'] = df.apply(map_mitre, axis=1)
-
-
-# Join AI result with original logs
 df['AnomalyLabel'] = df_feat['AnomalyLabel']
 
-# Show flagged events with mapped MITRE techniques
-malicious_events = df[df['AnomalyLabel'] == 'Malicious']
+# === JOIN RISK DATA BACK TO MAIN DF ===
+df['Severity'] = df_feat['Severity']
+df['RiskScore'] = df_feat['RiskScore']
 
-print("\n⚠️ Potential Threats Mapped to MITRE:")
-print(malicious_events[['TimeCreated', 'Id', 'AnomalyLabel', 'MITRE_Technique']].head())
-
-
-# Save features + labels for dashboard
+# === SAVE FOR DASHBOARD ===
 df_feat['MITRE_Technique'] = df['MITRE_Technique']
-df_feat.to_csv("ai_features.csv", index=False)
+df_feat.to_csv("data/ai_features.csv", index=False)
 
+# === PRINT THREAT SUMMARY ===
+print("\n⚠️ Potential Threats Mapped to MITRE:")
+print(df[df['AnomalyLabel'] == 'Malicious'][['TimeCreated', 'Id', 'AnomalyLabel', 'MITRE_Technique', 'Severity']].head())
 
-# Alert on latest malicious event
-malicious = df[df_feat['AnomalyLabel'] == 'Malicious']
-
+# === EMAIL ALERT ===
+malicious = df[df['AnomalyLabel'] == 'Malicious']
 if not malicious.empty:
     last = malicious.iloc[-1]
-    subject = f"[ALERT] Malicious Activity Detected - Event ID {last['Id']}"
+    subject = f"[ALERT] Malicious Activity Detected - Event ID {last['Id']} ({last['Severity']})"
     body = f"""
+🛡️ AI Threat Detection Alert
+
 Time: {last['TimeCreated']}
 Event ID: {last['Id']}
+Severity: {last['Severity']}
+Risk Score: {last['RiskScore']}
 MITRE Technique: {last['MITRE_Technique']}
-Message: {last['Message'][:500]}
+Message:
+{last['Message'][:500]}
 """
     send_email_alert(subject, body)
 
-# Only report on malicious entries
-malicious = df[df_feat['AnomalyLabel'] == 'Malicious']
-
-# Generate PDF
+# === GENERATE REPORT ===
 generate_report(malicious)
